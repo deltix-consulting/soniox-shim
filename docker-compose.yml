@@ -11,4 +11,4 @@ services:
 networks:
   default:
     external: true
-    name: ${STT_NETWORK:-vexa_default}
+    name: ${STT_NETWORK:-vexa-v012_vexa}

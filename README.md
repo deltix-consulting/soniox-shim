@@ -82,7 +82,7 @@ TRANSCRIPTION_SERVICE_TOKEN=<same value as SHIM_API_TOKEN>
 TRANSCRIPTION_MODEL=
 ```
 
-Put both stacks on the same Docker network (`STT_NETWORK` in `docker-compose.yml`, default `vexa_default`).
+Put both stacks on the same Docker network (`STT_NETWORK` in `docker-compose.yml`, default `vexa-v012_vexa`, the network of Vexa v0.12's compose project).
 
 **Cost note.** Vexa resubmits the unconfirmed tail of each turn every ~2 s, so each second of meeting audio is transcribed more than once. Every log line carries `audio_s_total`, the seconds of audio sent to Soniox since start; compare it with real meeting minutes to know your multiplier before you rely on a price estimate.
 
