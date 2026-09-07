@@ -1,14 +1,21 @@
 # soniox-shim
 
-A tiny OpenAI-compatible speech-to-text endpoint (`POST /v1/audio/transcriptions`) that forwards to [Soniox](https://soniox.com) real-time STT. Point any client that speaks the Whisper API at it: [Vexa](https://github.com/Vexa-ai/vexa), Open WebUI, LibreChat, your own code.
+A tiny OpenAI-compatible speech-to-text endpoint (`POST /v1/audio/transcriptions`) that forwards to [Soniox](https://soniox.com) speech-to-text. Point any client that speaks the Whisper API at it: [Vexa](https://github.com/Vexa-ai/vexa), Open WebUI, LibreChat, your own code.
 
 One file, no database, no state. Apache 2.0.
 
 ## How it works
 
-Every request opens one Soniox real-time WebSocket session, streams the audio, sends end-of-stream, collects the **final** tokens and returns them in Whisper's `verbose_json` shape: sentence-shaped segments with word-level timestamps and a per-word probability (Soniox's confidence).
+Every request is one Soniox async job: upload the file, create a transcription, poll until it completes, fetch the tokens, then delete the file and the transcription again so nothing stays behind at Soniox. The tokens are returned in Whisper's `verbose_json` shape: sentence-shaped segments with word-level timestamps and a per-word probability (Soniox's confidence).
 
-The real-time API is used rather than Soniox's async file API because callers like Vexa send short, growing audio windows (1–30 s) every couple of seconds and expect an answer within their request timeout. Upload → poll → fetch would not fit.
+Why the async API and not the real-time WebSocket: Soniox real-time processes at roughly real-time pace, so a 14 s clip takes ~12 s to come back. The async model runs faster than real time with a fixed overhead of a few seconds. Measured with a 16 kHz Dutch clip:
+
+| Clip | Real-time API | Async API |
+|---|---|---|
+| 2 s | 2.6 s | 4.8 s |
+| 14 s | 12.3 s | 7.7 s |
+
+Callers like Vexa send windows of up to ~30 s with a 30 s timeout, so async is the one that fits. It is also cheaper per hour and was more accurate on the same clip.
 
 ## Run
 
@@ -35,16 +42,16 @@ curl -s http://localhost:8083/v1/audio/transcriptions \
 | Variable | Default | Meaning |
 |---|---|---|
 | `SONIOX_API_KEY` | | Required. `GET /health` returns 503 without it. |
-| `SONIOX_MODEL` | `stt-rt-v5` | Soniox real-time model id. |
+| `SONIOX_MODEL` | `stt-async-v5` | Soniox async model id. |
 | `LANGUAGE_HINTS` | | Comma-separated ISO codes passed as `language_hints`, e.g. `nl,en`. The request's `language` is put in front. |
 | `SHIM_API_TOKEN` | | Optional. When set, requests must carry `Authorization: Bearer <token>`. |
-| `SONIOX_TIMEOUT_S` | `25` | Whole-request budget for the Soniox session. Returns 504 when exceeded. |
-| `SONIOX_URL` | `wss://stt-rt.soniox.com/transcribe-websocket` | Override for tests. |
+| `SONIOX_TIMEOUT_S` | `25` | Whole-request budget for upload, polling and fetch. Returns 504 when exceeded. |
+| `SONIOX_URL` | `https://api.soniox.com/v1` | Override for tests. |
 | `LOG_LEVEL` | `INFO` | |
 
 ## Request and response
 
-Accepted multipart fields: `file` (16-bit PCM WAV is sent as raw `pcm_s16le`; other formats are passed through with Soniox's `auto` detection), `model` (ignored), `response_format` (`json` default, `verbose_json`, `text`), `language`. Other Whisper fields (`prompt`, `timestamp_granularities`, …) are accepted and ignored.
+Accepted multipart fields: `file` (any format Soniox accepts; passed through unchanged), `model` (ignored), `response_format` (`json` default, `verbose_json`, `text`), `language`. Other Whisper fields (`prompt`, `timestamp_granularities`, …) are accepted and ignored.
 
 `verbose_json`:
 
@@ -85,4 +92,4 @@ Put both stacks on the same Docker network (`STT_NETWORK` in `docker-compose.yml
 uv run ruff check . && uv run pytest -q
 ```
 
-Tests run against a fake Soniox WebSocket server in `tests/fake_soniox.py`; no API key needed.
+Tests run against a fake Soniox REST server in `tests/fake_soniox.py`; no API key needed.

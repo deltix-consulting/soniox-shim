@@ -1,13 +1,12 @@
 """soniox-shim — an OpenAI-compatible `/v1/audio/transcriptions` endpoint in front of Soniox.
 
-Each request opens one Soniox real-time WebSocket session, streams the audio, waits for the
-final tokens and returns them as Whisper-style `verbose_json` (segments with word timestamps).
-Configuration is environment only; see README.md.
+Each request is one Soniox async job: upload the file, create a transcription, poll until it is
+done, fetch the tokens, delete both again. The tokens come back as Whisper-style `verbose_json`
+(sentence-shaped segments with word timestamps). Configuration is environment only; see README.md.
 """
 
 import asyncio
 import io
-import json
 import logging
 import os
 import secrets
@@ -16,13 +15,12 @@ import wave
 from collections import Counter
 from typing import Annotated
 
+import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
-from websockets.asyncio.client import connect
-from websockets.exceptions import WebSocketException
 
 SEGMENT_GAP_S = 1.0  # a pause longer than this starts a new segment
-WS_CHUNK = 64 * 1024
+POLL_S = 0.4
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s"
@@ -42,51 +40,72 @@ class SonioxError(Exception):
         self.code, self.message = code, message
 
 
-def unpack_audio(data: bytes) -> tuple[dict, bytes, float]:
-    """16-bit PCM WAV → (pcm_s16le config, raw frames, duration). Anything else → Soniox 'auto'."""
+def wav_duration(data: bytes) -> float:
+    """Seconds of audio if this is a WAV we can read, else 0 (duration is informational only)."""
     try:
         with wave.open(io.BytesIO(data)) as w:
-            if w.getsampwidth() == 2 and w.getcomptype() == "NONE":
-                fmt = {
-                    "audio_format": "pcm_s16le",
-                    "sample_rate": w.getframerate(),
-                    "num_channels": w.getnchannels(),
-                }
-                return fmt, w.readframes(w.getnframes()), w.getnframes() / w.getframerate()
-    except Exception:  # noqa: BLE001 — not a WAV we understand; let Soniox detect it
-        pass
-    return {"audio_format": "auto"}, data, 0.0
+            return w.getnframes() / w.getframerate()
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
-async def soniox_transcribe(fmt: dict, audio: bytes, hints: list[str]) -> list[dict]:
-    """One real-time session: config → audio → end-of-stream → final tokens until `finished`."""
-    cfg = {"api_key": env("SONIOX_API_KEY"), "model": env("SONIOX_MODEL", "stt-rt-v5"), **fmt}
-    if hints:
-        cfg["language_hints"] = hints
-    url = env("SONIOX_URL", "wss://stt-rt.soniox.com/transcribe-websocket")
-    tokens: list[dict] = []
+def _checked(r: httpx.Response) -> dict:
+    if r.status_code >= 400:
+        raise SonioxError(r.status_code, r.text[:200])
+    return r.json() if r.content else {}
+
+
+async def _cleanup(client_args: dict, transcription_id: str | None, file_id: str | None) -> None:
+    """Best effort, own budget: leave no audio or transcript behind at Soniox."""
     try:
-        async with asyncio.timeout(float(env("SONIOX_TIMEOUT_S", "25"))):
-            async with connect(url, max_size=None) as ws:
-                await ws.send(json.dumps(cfg))
-                for i in range(0, len(audio), WS_CHUNK):
-                    await ws.send(audio[i : i + WS_CHUNK])
-                await ws.send("")  # empty frame = end of audio
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    if msg.get("error_code"):
-                        raise SonioxError(int(msg["error_code"]), msg.get("error_message", ""))
-                    tokens += [t for t in msg.get("tokens", []) if t.get("is_final")]
-                    if msg.get("finished"):
-                        break
+        async with asyncio.timeout(10), httpx.AsyncClient(**client_args, timeout=10) as c:
+            paths = [f"/transcriptions/{transcription_id}"] if transcription_id else []
+            paths += [f"/files/{file_id}"] if file_id else []
+            await asyncio.gather(*(c.delete(p) for p in paths))
+    except (httpx.HTTPError, TimeoutError) as e:
+        log.warning("cleanup failed transcription=%s file=%s: %s", transcription_id, file_id, e)
+
+
+async def soniox_transcribe(audio: bytes, filename: str, hints: list[str]) -> list[dict]:
+    """Upload → create transcription → poll → fetch tokens. Raises HTTPException on any failure."""
+    client_args = {
+        "base_url": env("SONIOX_URL", "https://api.soniox.com/v1"),
+        "headers": {"Authorization": f"Bearer {env('SONIOX_API_KEY')}"},
+    }
+    timeout = float(env("SONIOX_TIMEOUT_S", "25"))
+    file_id = transcription_id = None
+    try:
+        async with (
+            asyncio.timeout(timeout),
+            httpx.AsyncClient(**client_args, timeout=timeout) as c,
+        ):
+            r = await c.post(
+                "/files", files={"file": (filename, audio, "application/octet-stream")}
+            )
+            file_id = _checked(r)["id"]
+            body: dict = {"file_id": file_id, "model": env("SONIOX_MODEL", "stt-async-v5")}
+            if hints:
+                body["language_hints"] = hints
+            job = _checked(await c.post("/transcriptions", json=body))
+            transcription_id = job["id"]
+            while job.get("status") not in ("completed", "error"):
+                await asyncio.sleep(POLL_S)
+                job = _checked(await c.get(f"/transcriptions/{transcription_id}"))
+            if job["status"] == "error":
+                raise SonioxError(502, job.get("error_message", "transcription failed"))
+            return _checked(await c.get(f"/transcriptions/{transcription_id}/transcript")).get(
+                "tokens", []
+            )
     except TimeoutError as e:
         raise HTTPException(504, "soniox: no result within SONIOX_TIMEOUT_S") from e
-    except (OSError, WebSocketException) as e:
+    except httpx.HTTPError as e:
         raise HTTPException(503, f"soniox unavailable: {e}") from e
     except SonioxError as e:
         status = e.code if e.code in (400, 401, 402, 429) else 502
         raise HTTPException(status, str(e)) from e
-    return tokens
+    finally:
+        if file_id:
+            await _cleanup(client_args, transcription_id, file_id)
 
 
 def to_words(tokens: list[dict]) -> list[dict]:
@@ -94,8 +113,8 @@ def to_words(tokens: list[dict]) -> list[dict]:
     words: list[dict] = []
     for t in tokens:
         text = t.get("text", "")
-        if not text.strip() or (text.startswith("<") and text.endswith(">")):  # <end>, <fin>
-            continue
+        if not text.strip() or t.get("is_audio_event") or text.strip().startswith("<"):
+            continue  # silence, "(laughter)"-style events, <end>/<fin> markers
         conf = float(t.get("confidence", 1.0))
         if words and not text[0].isspace():
             w = words[-1]
@@ -155,7 +174,7 @@ def require_token(authorization: str | None) -> None:
 def health() -> dict:
     if not env("SONIOX_API_KEY"):
         raise HTTPException(503, "SONIOX_API_KEY not set")
-    return {"status": "ok", "model": env("SONIOX_MODEL", "stt-rt-v5")}
+    return {"status": "ok", "model": env("SONIOX_MODEL", "stt-async-v5")}
 
 
 @app.post("/v1/audio/transcriptions")
@@ -171,13 +190,13 @@ async def transcriptions(
     data = await file.read()
     if not data:
         raise HTTPException(400, "empty audio file")
-    fmt, audio, duration = unpack_audio(data)
+    duration = wav_duration(data)
     # DECISION: the request's language comes first, then LANGUAGE_HINTS (e.g. "nl,en" so a Dutch
     # meeting with English terms is not forced into one language). Duplicates dropped.
     hints = list(dict.fromkeys([h for h in [language, *env("LANGUAGE_HINTS").split(",")] if h]))
 
     t0 = time.monotonic()
-    tokens = await soniox_transcribe(fmt, audio, hints)
+    tokens = await soniox_transcribe(data, file.filename or "audio.wav", hints)
     words = to_words(tokens)
     segments = to_segments(words)
     text = " ".join(s["text"] for s in segments)
@@ -185,12 +204,11 @@ async def transcriptions(
     detected = langs.most_common(1)[0][0] if langs else (language or "unknown")
     audio_seconds_total += duration
     log.info(
-        "ok ms=%d audio_s=%.1f words=%d lang=%s fmt=%s audio_s_total=%.0f",
+        "ok ms=%d audio_s=%.1f words=%d lang=%s audio_s_total=%.0f",
         (time.monotonic() - t0) * 1000,
         duration,
         len(words),
         detected,
-        fmt["audio_format"],
         audio_seconds_total,
     )
 

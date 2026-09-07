@@ -18,29 +18,26 @@ def wav_bytes(seconds: float = 0.5, rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-def tok(text, start, end, final=True, conf=0.9, lang="nl"):
+def tok(text, start, end, conf=0.9, lang="nl", **extra):
     return {
         "text": text,
         "start_ms": start,
         "end_ms": end,
-        "is_final": final,
         "confidence": conf,
         "language": lang,
+        **extra,
     }
 
 
-SCRIPT = [
-    {
-        "tokens": [
-            tok("Hal", 0, 100),
-            tok("lo", 100, 200),
-            tok(" wereld", 200, 500),
-            tok(".", 500, 520),
-        ]
-    },
-    {"tokens": [tok(" dit", 600, 700, final=False)]},  # non-final: must be ignored
-    {"tokens": [tok(" Dit", 600, 700), tok(" werkt", 700, 900, conf=0.4), tok("<end>", 900, 900)]},
-    {"tokens": [], "finished": True},
+TOKENS = [
+    tok("Hal", 0, 100),
+    tok("lo", 100, 200),
+    tok(" wereld", 200, 500),
+    tok(".", 500, 520),
+    tok(" (laughter)", 520, 590, is_audio_event=True),  # audio event: must be dropped
+    tok(" Dit", 600, 700),
+    tok(" werkt", 700, 900, conf=0.4),
+    tok("<end>", 900, 900),
 ]
 
 
@@ -62,7 +59,7 @@ def post(client, data, **form):
 
 
 def test_verbose_json_matches_whisper_shape(client, monkeypatch):
-    with FakeSoniox(SCRIPT) as fake:
+    with FakeSoniox(TOKENS) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = post(client, wav_bytes(), response_format="verbose_json", language="nl")
     assert r.status_code == 200, r.text
@@ -79,23 +76,21 @@ def test_verbose_json_matches_whisper_shape(client, monkeypatch):
     ]
     assert body["segments"][1]["words"][1]["probability"] == 0.4
     # what Soniox saw
-    assert fake.config["model"] == "stt-rt-v5"
-    assert fake.config["api_key"] == "test-key"
-    assert fake.config["audio_format"] == "pcm_s16le"
-    assert fake.config["sample_rate"] == 16000 and fake.config["num_channels"] == 1
-    assert fake.config["language_hints"] == ["nl", "en"]
-    assert fake.audio == b"\x00\x00" * 8000  # raw frames, header stripped
+    assert fake.audio == wav_bytes() and fake.filename == "audio.wav"
+    assert fake.job == {"file_id": "f1", "model": "stt-async-v5", "language_hints": ["nl", "en"]}
+    assert fake.polls >= 2
+    assert sorted(fake.deleted) == ["f1", "t1"]  # nothing left behind at Soniox
 
 
 def test_json_and_text_formats(client, monkeypatch):
-    with FakeSoniox(SCRIPT) as fake:
+    with FakeSoniox(TOKENS) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         assert post(client, wav_bytes()).json() == {"text": "Hallo wereld. Dit werkt"}
         assert post(client, wav_bytes(), response_format="text").text == "Hallo wereld. Dit werkt"
 
 
-def test_non_wav_is_forwarded_as_auto(client, monkeypatch):
-    with FakeSoniox([{"tokens": [], "finished": True}]) as fake:
+def test_non_wav_is_forwarded_unchanged(client, monkeypatch):
+    with FakeSoniox([]) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = post(client, b"OggS not really audio", response_format="verbose_json")
     assert r.status_code == 200
@@ -106,29 +101,30 @@ def test_non_wav_is_forwarded_as_auto(client, monkeypatch):
         "text": "",
         "segments": [],
     }
-    assert fake.config["audio_format"] == "auto"
     assert fake.audio == b"OggS not really audio"
 
 
 def test_soniox_error_codes_map_to_http(client, monkeypatch):
-    with FakeSoniox([{"error_code": 402, "error_message": "balance exhausted"}]) as fake:
+    with FakeSoniox(upload_status=402) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = post(client, wav_bytes())
     assert r.status_code == 402
     assert "balance exhausted" in r.json()["detail"]
-    with FakeSoniox([{"error_code": 500, "error_message": "boom"}]) as fake:
+    with FakeSoniox(job_error="boom") as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
-        assert post(client, wav_bytes()).status_code == 502
+        r = post(client, wav_bytes())
+    assert r.status_code == 502 and "boom" in r.json()["detail"]
+    assert sorted(fake.deleted) == ["f1", "t1"]  # cleaned up even after a failed job
 
 
 def test_unreachable_soniox_is_503(client, monkeypatch):
-    monkeypatch.setenv("SONIOX_URL", "ws://127.0.0.1:1")
+    monkeypatch.setenv("SONIOX_URL", "http://127.0.0.1:1")
     assert post(client, wav_bytes()).status_code == 503
 
 
 def test_timeout_is_504(client, monkeypatch):
-    monkeypatch.setenv("SONIOX_TIMEOUT_S", "0.3")
-    with FakeSoniox([], hang=True) as fake:
+    monkeypatch.setenv("SONIOX_TIMEOUT_S", "0.5")
+    with FakeSoniox(hang=True) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         assert post(client, wav_bytes()).status_code == 504
 
@@ -140,7 +136,7 @@ def test_empty_file_is_400(client):
 def test_bearer_token(client, monkeypatch):
     monkeypatch.setenv("SHIM_API_TOKEN", "s3cret")
     assert post(client, wav_bytes()).status_code == 401
-    with FakeSoniox([{"tokens": [], "finished": True}]) as fake:
+    with FakeSoniox([]) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = client.post(
             "/v1/audio/transcriptions",
