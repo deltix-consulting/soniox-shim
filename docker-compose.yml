@@ -1,0 +1,14 @@
+services:
+  soniox-shim:
+    build: .
+    image: soniox-shim
+    container_name: soniox-shim
+    env_file: .env
+    restart: unless-stopped
+    # No ports published: callers reach it on the shared Docker network as http://soniox-shim:8000.
+    # To use it from the host during a smoke test, add:  ports: ["127.0.0.1:8083:8000"]
+
+networks:
+  default:
+    external: true
+    name: ${STT_NETWORK:-vexa_default}

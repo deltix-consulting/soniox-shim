@@ -1,0 +1,26 @@
+[project]
+name = "soniox-shim"
+version = "0.1.0"
+description = "OpenAI-compatible /v1/audio/transcriptions endpoint backed by Soniox real-time STT"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "websockets>=13",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "httpx2"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
