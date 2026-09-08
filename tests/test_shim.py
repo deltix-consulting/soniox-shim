@@ -1,4 +1,5 @@
 import io
+import math
 import wave
 
 import pytest
@@ -44,9 +45,18 @@ TOKENS = [
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("SONIOX_API_KEY", "test-key")
-    monkeypatch.setenv("LANGUAGE_HINTS", "nl,en")
+    monkeypatch.setenv("LANGUAGE_HINTS", "nl, en")  # a space after the comma is tolerated
     monkeypatch.delenv("SHIM_API_TOKEN", raising=False)
-    return TestClient(app)
+    with TestClient(app) as c:  # context manager keeps the loop alive for background cleanup
+        yield c
+
+
+def wait_deleted(fake, n=2, timeout=2.0):
+    import time
+
+    deadline = time.time() + timeout
+    while len(fake.deleted) < n and time.time() < deadline:
+        time.sleep(0.02)
 
 
 def post(client, data, **form):
@@ -61,7 +71,10 @@ def post(client, data, **form):
 def test_verbose_json_matches_whisper_shape(client, monkeypatch):
     with FakeSoniox(TOKENS) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
-        r = post(client, wav_bytes(), response_format="verbose_json", language="nl")
+        r = post(
+            client, wav_bytes(), response_format="verbose_json", language="nl", prompt="Vorige zin."
+        )
+        wait_deleted(fake)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["text"] == "Hallo wereld. Dit werkt"
@@ -70,14 +83,22 @@ def test_verbose_json_matches_whisper_shape(client, monkeypatch):
     assert [s["text"] for s in body["segments"]] == ["Hallo wereld.", "Dit werkt"]
     seg = body["segments"][0]
     assert seg["start"] == 0.0 and seg["end"] == 0.52
+    # words carry their leading space, like Whisper: consumers concatenate them verbatim
     assert seg["words"] == [
-        {"word": "Hallo", "start": 0.0, "end": 0.2, "probability": 0.9},
-        {"word": "wereld.", "start": 0.2, "end": 0.52, "probability": 0.9},
+        {"word": " Hallo", "start": 0.0, "end": 0.2, "probability": 0.9},
+        {"word": " wereld.", "start": 0.2, "end": 0.52, "probability": 0.9},
     ]
+    assert "".join(w["word"] for w in seg["words"]).strip() == seg["text"]
+    assert seg["avg_logprob"] == pytest.approx(math.log(0.9), abs=1e-3)
     assert body["segments"][1]["words"][1]["probability"] == 0.4
     # what Soniox saw
     assert fake.audio == wav_bytes() and fake.filename == "audio.wav"
-    assert fake.job == {"file_id": "f1", "model": "stt-async-v5", "language_hints": ["nl", "en"]}
+    assert fake.job == {
+        "file_id": "f1",
+        "model": "stt-async-v5",
+        "language_hints": ["nl", "en"],
+        "context": {"text": "Vorige zin."},
+    }
     assert fake.polls >= 2
     assert sorted(fake.deleted) == ["f1", "t1"]  # nothing left behind at Soniox
 
@@ -96,7 +117,7 @@ def test_non_wav_is_forwarded_unchanged(client, monkeypatch):
     assert r.status_code == 200
     assert r.json() == {
         "task": "transcribe",
-        "language": "unknown",
+        "language": None,
         "duration": 0.0,
         "text": "",
         "segments": [],
@@ -113,8 +134,15 @@ def test_soniox_error_codes_map_to_http(client, monkeypatch):
     with FakeSoniox(job_error="boom") as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = post(client, wav_bytes())
-    assert r.status_code == 502 and "boom" in r.json()["detail"]
+        wait_deleted(fake)
+    assert r.status_code == 400 and "boom" in r.json()["detail"]  # bad input: final, no retry
     assert sorted(fake.deleted) == ["f1", "t1"]  # cleaned up even after a failed job
+    with FakeSoniox(upload_status=403) as fake:  # revoked key: final, not a 502 to retry forever
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        assert post(client, wav_bytes()).status_code == 403
+    with FakeSoniox(upload_status=503) as fake:
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        assert post(client, wav_bytes()).status_code == 502
 
 
 def test_unreachable_soniox_is_503(client, monkeypatch):
@@ -136,6 +164,13 @@ def test_empty_file_is_400(client):
 def test_bearer_token(client, monkeypatch):
     monkeypatch.setenv("SHIM_API_TOKEN", "s3cret")
     assert post(client, wav_bytes()).status_code == 401
+    r = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("a.wav", wav_bytes(), "audio/wav")},
+        data={"model": "whisper-1"},
+        headers={b"Authorization": "Bearer caf\xe9".encode("latin-1")},  # non-ASCII → 401, not 500
+    )
+    assert r.status_code == 401
     with FakeSoniox([]) as fake:
         monkeypatch.setenv("SONIOX_URL", fake.url)
         r = client.post(
@@ -157,3 +192,47 @@ def test_segments_split_on_pause():
     words = to_words([tok(" een", 0, 100), tok(" twee", 1500, 1600), tok(" drie", 1700, 1800)])
     assert [s["text"] for s in to_segments(words)] == ["een", "twee drie"]
     assert to_segments([]) == []
+
+
+def test_transient_poll_errors_do_not_kill_a_running_job(client, monkeypatch):
+    with FakeSoniox(TOKENS, flaky_polls=2) as fake:
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        r = post(client, wav_bytes())
+    assert r.status_code == 200 and fake.polls >= 3  # two 429s were retried, not fatal
+
+
+def test_word_boundaries_from_whitespace_tokens_and_trailing_spaces():
+    words = to_words(
+        [
+            tok("Hal", 0, 100),
+            tok(" ", 100, 100),
+            tok("lo", 100, 200),
+            tok("we ", 200, 300),
+            tok("reld", 300, 400),
+        ]
+    )
+    # " " is a boundary; "we " has no leading space so it continues "lo", its trailing space ends it
+    assert [w["word"] for w in words] == [" Hal", " lowe", " reld"]
+    words = to_words([tok("Hal", 0, 100), tok("lo", 100, 200), tok(" wereld", 200, 300)])
+    assert [w["word"] for w in words] == [" Hallo", " wereld"]
+
+
+def test_sentence_ends_inside_closing_quote():
+    words = to_words(
+        [
+            tok(" Weet", 0, 100),
+            tok(" je", 100, 200),
+            tok(" het", 200, 300),
+            tok(" zeker", 300, 400),
+            tok('?"', 400, 410),
+            tok(" Ja", 420, 500),
+            tok(".", 500, 510),
+        ]
+    )
+    assert [s["text"] for s in to_segments(words)] == ['Weet je het zeker?"', "Ja."]
+
+
+def test_tokens_without_timestamps_are_skipped():
+    assert to_words([{"text": " x", "confidence": 1}, tok(" ok", 0, 10)]) == [
+        {"word": " ok", "start": 0.0, "end": 0.01, "probability": 0.9, "language": "nl"}
+    ]

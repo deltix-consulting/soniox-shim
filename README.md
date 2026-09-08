@@ -44,14 +44,14 @@ curl -s http://localhost:8083/v1/audio/transcriptions \
 | `SONIOX_API_KEY` | | Required. `GET /health` returns 503 without it. |
 | `SONIOX_MODEL` | `stt-async-v5` | Soniox async model id. |
 | `LANGUAGE_HINTS` | | Comma-separated ISO codes passed as `language_hints`, e.g. `nl,en`. The request's `language` is put in front. |
-| `SHIM_API_TOKEN` | | Optional. When set, requests must carry `Authorization: Bearer <token>`. |
-| `SONIOX_TIMEOUT_S` | `25` | Whole-request budget for upload, polling and fetch. Returns 504 when exceeded. |
+| `SHIM_API_TOKEN` | | Optional but recommended. When set, requests must carry `Authorization: Bearer <token>`; when empty the shim logs a warning at start and accepts anyone on the network. |
+| `SONIOX_TIMEOUT_S` | `20` | Whole-request budget for upload, polling and fetch. Returns 504 when exceeded. Keep well under the caller's timeout (Vexa: 30 s). |
 | `SONIOX_URL` | `https://api.soniox.com/v1` | Override for tests. |
 | `LOG_LEVEL` | `INFO` | |
 
 ## Request and response
 
-Accepted multipart fields: `file` (any format Soniox accepts; passed through unchanged), `model` (ignored), `response_format` (`json` default, `verbose_json`, `text`), `language`. Other Whisper fields (`prompt`, `timestamp_granularities`, …) are accepted and ignored.
+Accepted multipart fields: `file` (any format Soniox accepts; passed through unchanged), `model` (ignored), `response_format` (`json` default, `verbose_json`, `text`), `language`, and `prompt` (forwarded to Soniox as `context.text`, so a caller's already-confirmed text conditions the next window). Other Whisper fields (`timestamp_granularities`, …) are accepted and ignored.
 
 `verbose_json`:
 
@@ -68,9 +68,9 @@ Accepted multipart fields: `file` (any format Soniox accepts; passed through unc
 }
 ```
 
-Segments split after `.`, `?`, `!` or on a pause longer than one second. Whisper-only fields (`avg_logprob`, `no_speech_prob`, `compression_ratio`) are not returned; clients that filter on them keep the segment.
+Segments split after `.`, `?`, `!` (closing quotes allowed) or on a pause longer than one second. Words carry their leading space, as Whisper's do, so a client may concatenate them verbatim. `avg_logprob` is derived from Soniox's confidence (log of the segment's mean word confidence) so Whisper-style low-confidence filters keep working; `no_speech_prob` and `compression_ratio` are not returned, and clients treat their absence as "keep".
 
-Errors: Soniox `400/401/402/429` are returned as-is, other Soniox errors as `502`, unreachable as `503`, timeout as `504`. Retrying clients treat 5xx as transient and 401/402 as final, which is what you want.
+Errors: every Soniox `4xx` is returned as-is (bad key, unknown model, oversized payload: final, do not retry), a transcription that ends in Soniox status `error` is `400` (the input will fail again), Soniox `5xx` becomes `502`, unreachable `503`, timeout `504`. A transient `429`/`5xx` on a status poll is retried three times before the job is given up. Cleanup of the uploaded file and the transcription happens in the background after the response, so the response time stays within `SONIOX_TIMEOUT_S`.
 
 ## Wiring it into Vexa
 

@@ -16,9 +16,11 @@ class FakeSoniox:
         upload_status: int = 201,
         job_error: str | None = None,
         hang: bool = False,
+        flaky_polls: int = 0,
     ):
         self.tokens = tokens or []
         self.upload_status, self.job_error, self.hang = upload_status, job_error, hang
+        self.flaky_polls = flaky_polls
         self.audio = b""
         self.filename = ""
         self.job: dict = {}
@@ -45,6 +47,9 @@ class FakeSoniox:
             self.polls += 1
             if self.hang:
                 await asyncio.sleep(60)
+            if self.flaky_polls > 0:
+                self.flaky_polls -= 1
+                return Response('{"message":"rate limited"}', 429)
             if self.job_error:
                 return {"id": "t1", "status": "error", "error_message": self.job_error}
             return {"id": "t1", "status": "queued" if self.polls < 2 else "completed"}
