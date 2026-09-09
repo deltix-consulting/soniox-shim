@@ -84,7 +84,7 @@ TRANSCRIPTION_MODEL=
 
 Put both stacks on the same Docker network (`STT_NETWORK` in `docker-compose.yml`, default `vexa-v012_vexa`, the network of Vexa v0.12's compose project).
 
-**Cost note.** Vexa resubmits the unconfirmed tail of each turn every ~2 s, so each second of meeting audio is transcribed more than once. Every log line carries `audio_s_total`, the seconds of audio sent to Soniox since start; compare it with real meeting minutes to know your multiplier before you rely on a price estimate.
+**Cost note.** Vexa resubmits the unconfirmed tail of each turn every ~2 s, so each second of meeting audio is transcribed more than once. Measured with Vexa's own `clean-audio-replay` (real `ChunkedTranscriber`, `--realtime`) on a 90 s Dutch clip: 16 requests, 260 s of audio submitted, **2.9× the source duration**, i.e. about $0.29 per meeting hour at Soniox's async price. Every log line carries `audio_s_total` so you can check your own multiplier.
 
 ## Development
 
