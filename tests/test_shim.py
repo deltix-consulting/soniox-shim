@@ -5,6 +5,7 @@ import wave
 import pytest
 from fastapi.testclient import TestClient
 
+import shim
 from shim import app, to_segments, to_words
 from tests.fake_soniox import FakeSoniox
 
@@ -47,6 +48,8 @@ def client(monkeypatch):
     monkeypatch.setenv("SONIOX_API_KEY", "test-key")
     monkeypatch.setenv("LANGUAGE_HINTS", "nl, en")  # a space after the comma is tolerated
     monkeypatch.delenv("SHIM_API_TOKEN", raising=False)
+    monkeypatch.setattr(shim, "last_ok_at", None)
+    monkeypatch.setattr(shim, "last_account_error", None)
     with TestClient(app) as c:  # context manager keeps the loop alive for background cleanup
         yield c
 
@@ -186,6 +189,24 @@ def test_health(client, monkeypatch):
     assert client.get("/health").status_code == 200
     monkeypatch.delenv("SONIOX_API_KEY")
     assert client.get("/health").status_code == 503
+
+
+def test_health_reports_exhausted_balance_until_the_next_success(client, monkeypatch):
+    with FakeSoniox(upload_status=402) as fake:
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        assert post(client, wav_bytes()).status_code == 402
+    r = client.get("/health")
+    assert r.status_code == 503
+    assert r.json()["status"] == "soniox_account_error"
+    assert r.json()["last_account_error"]["code"] == 402
+    with FakeSoniox(upload_status=400) as fake:  # a bad input is not an account problem
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        post(client, wav_bytes())
+    assert client.get("/health").status_code == 503  # still the 402, nothing succeeded since
+    with FakeSoniox(TOKENS) as fake:  # topped up: the next request goes through
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        assert post(client, wav_bytes()).status_code == 200
+    assert client.get("/health").status_code == 200
 
 
 def test_segments_split_on_pause():

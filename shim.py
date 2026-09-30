@@ -18,13 +18,16 @@ from typing import Annotated
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 SEGMENT_GAP_S = 1.0  # a pause longer than this starts a new segment
 POLL_S = 0.4
 POLL_RETRIES = 3  # transient 429/5xx on a status poll must not kill a running (billed) job
 CLOSERS = "\"'”’)]»"  # closing punctuation that may follow the sentence-ending mark
 CONTEXT_MAX_CHARS = 10_000  # Soniox context limit (~8k tokens)
+# Soniox answers that fail EVERY request until a human acts: bad key (401), no access (403),
+# balance or monthly budget exhausted (402). /health reports them so a monitor can alert.
+ACCOUNT_ERRORS = (401, 402, 403)
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s"
@@ -33,6 +36,9 @@ log = logging.getLogger("soniox-shim")
 app = FastAPI(title="soniox-shim", docs_url=None, redoc_url=None)
 audio_seconds_total = 0.0  # audio sent to Soniox since start — the number your bill follows
 _background: set[asyncio.Task] = set()
+# The latest Soniox outcome, for /health. In memory: a restart forgets it until the next request.
+last_ok_at: float | None = None
+last_account_error: dict | None = None  # {"at", "code", "message"}
 
 
 def env(name: str, default: str = "") -> str:
@@ -140,6 +146,10 @@ async def soniox_transcribe(
     except httpx.HTTPError as e:
         raise HTTPException(503, f"soniox unavailable: {e}") from e
     except SonioxError as e:
+        if e.code in ACCOUNT_ERRORS:
+            global last_account_error
+            last_account_error = {"at": time.time(), "code": e.code, "message": e.message}
+            log.error("soniox account error %d: %s", e.code, e.message)
         # 4xx are final for the caller (bad key, model, payload); 5xx come back as 502 = retry.
         status = e.code if e.code < 500 else 502
         raise HTTPException(status, str(e)) from e
@@ -233,10 +243,22 @@ def require_token(authorization: str | None) -> None:
 
 
 @app.get("/health")
-def health() -> dict:
+def health():
+    """503 while Soniox can not transcribe for account reasons: no key, or the latest Soniox answer
+    was an account error (402 balance/budget, 401 key, 403) with no success since. Cleared by the
+    next successful request — so after a top-up it stays 503 until audio flows again."""
     if not env("SONIOX_API_KEY"):
         raise HTTPException(503, "SONIOX_API_KEY not set")
-    return {"status": "ok", "model": env("SONIOX_MODEL", "stt-async-v5")}
+    body = {
+        "status": "ok",
+        "model": env("SONIOX_MODEL", "stt-async-v5"),
+        "last_ok_at": last_ok_at,
+        "last_account_error": last_account_error,
+    }
+    err = last_account_error
+    if err and (last_ok_at is None or err["at"] > last_ok_at):
+        return JSONResponse({**body, "status": "soniox_account_error"}, 503)
+    return body
 
 
 @app.post("/v1/audio/transcriptions")
@@ -248,7 +270,7 @@ async def transcriptions(
     prompt: Annotated[str | None, Form()] = None,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    global audio_seconds_total
+    global audio_seconds_total, last_ok_at
     require_token(authorization)
     data = await file.read()
     if not data:
@@ -267,6 +289,7 @@ async def transcriptions(
     langs = Counter(w["language"] for w in words if w.get("language"))
     detected = langs.most_common(1)[0][0] if langs else language  # None when nobody knows
     audio_seconds_total += duration
+    last_ok_at = time.time()
     log.info(
         "ok ms=%d audio_s=%.1f words=%d lang=%s audio_s_total=%.0f",
         (time.monotonic() - t0) * 1000,

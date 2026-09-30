@@ -49,6 +49,10 @@ curl -s http://localhost:8083/v1/audio/transcriptions \
 | `SONIOX_URL` | `https://api.soniox.com/v1` | Override for tests. |
 | `LOG_LEVEL` | `INFO` | |
 
+## Health
+
+`GET /health` returns 200 with `last_ok_at` and `last_account_error`, or **503** when the shim can not transcribe for an account reason: no `SONIOX_API_KEY`, or the latest Soniox answer was 401 (key), 403 (access) or 402 (balance or monthly budget exhausted) with no successful request since. Point any monitor at it to hear about an empty Soniox balance before your users do. The state is in memory and clears on the next successful request, so after a top-up it stays 503 until audio flows again.
+
 ## Request and response
 
 Accepted multipart fields: `file` (any format Soniox accepts; passed through unchanged), `model` (ignored), `response_format` (`json` default, `verbose_json`, `text`), `language`, and `prompt` (forwarded to Soniox as `context.text`, so a caller's already-confirmed text conditions the next window). Other Whisper fields (`timestamp_granularities`, …) are accepted and ignored.
