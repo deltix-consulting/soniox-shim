@@ -1,0 +1,25 @@
+# Optional: push to main → ssh to your server → docker compose up -d.
+# Off unless the repo variable DEPLOY_ENABLED is 'true'.
+# Repo secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY. Repo variable: DEPLOY_PATH (the checkout on the server).
+name: deploy
+on:
+  push:
+    branches: [main]
+concurrency: deploy
+jobs:
+  deploy:
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd "${{ vars.DEPLOY_PATH }}"
+            git fetch --quiet origin main
+            git reset --hard origin/main
+            docker compose up -d --build --remove-orphans
+            docker compose ps

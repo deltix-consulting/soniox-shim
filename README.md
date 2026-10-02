@@ -97,3 +97,7 @@ uv run ruff check . && uv run pytest -q
 ```
 
 Tests run against a fake Soniox REST server in `tests/fake_soniox.py`; no API key needed.
+
+## Deploy (optional)
+
+`.github/workflows/deploy.yml` deploys every push to `main` over SSH: on the server it resets the checkout to `origin/main` and runs `docker compose up -d --build`. It is off until you set the repo variable `DEPLOY_ENABLED=true`, plus `DEPLOY_PATH` (the checkout on the server) and the secrets `DEPLOY_HOST`, `DEPLOY_USER` and `DEPLOY_SSH_KEY`. Use a dedicated key for a user that may run Docker.
