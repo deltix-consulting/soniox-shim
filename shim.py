@@ -127,9 +127,16 @@ async def soniox_transcribe(
             body: dict = {"file_id": file_id, "model": env("SONIOX_MODEL", "stt-async-v5")}
             if hints:
                 body["language_hints"] = hints
+            context: dict = {}
             if prompt:
                 # Whisper's `prompt` (the caller's already-confirmed text) → Soniox context text.
-                body["context"] = {"text": prompt[-CONTEXT_MAX_CHARS:]}
+                context["text"] = prompt[-CONTEXT_MAX_CHARS:]
+            terms = [t.strip() for t in env("CONTEXT_TERMS").split(",") if t.strip()]
+            if terms:
+                # Words Soniox must spell right on every request (product names, people).
+                context["terms"] = terms
+            if context:
+                body["context"] = context
             job = _checked(await c.post("/transcriptions", json=body))
             transcription_id = job["id"]
             while job.get("status") not in ("completed", "error"):

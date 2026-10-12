@@ -44,6 +44,7 @@ curl -s http://localhost:8083/v1/audio/transcriptions \
 | `SONIOX_API_KEY` | | Required. `GET /health` returns 503 without it. |
 | `SONIOX_MODEL` | `stt-async-v5` | Soniox async model id. |
 | `LANGUAGE_HINTS` | | Comma-separated ISO codes passed as `language_hints`, e.g. `nl,en`. The request's `language` is put in front. |
+| `CONTEXT_TERMS` | | Comma-separated words sent as Soniox `context.terms` on every request, so names and jargon come out spelled right (e.g. `Odoo,SharePoint,Jane Doe`). |
 | `SHIM_API_TOKEN` | | Optional but recommended. When set, requests must carry `Authorization: Bearer <token>`; when empty the shim logs a warning at start and accepts anyone on the network. |
 | `SONIOX_TIMEOUT_S` | `20` | Whole-request budget for upload, polling and fetch. Returns 504 when exceeded. Keep well under the caller's timeout (Vexa: 30 s). |
 | `SONIOX_URL` | `https://api.soniox.com/v1` | Override for tests. |
