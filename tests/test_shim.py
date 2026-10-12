@@ -257,3 +257,11 @@ def test_tokens_without_timestamps_are_skipped():
     assert to_words([{"text": " x", "confidence": 1}, tok(" ok", 0, 10)]) == [
         {"word": " ok", "start": 0.0, "end": 0.01, "probability": 0.9, "language": "nl"}
     ]
+
+
+def test_context_terms_go_with_every_request(client, monkeypatch):
+    monkeypatch.setenv("CONTEXT_TERMS", "Odoo, SharePoint,,Jane Doe")
+    with FakeSoniox(TOKENS) as fake:
+        monkeypatch.setenv("SONIOX_URL", fake.url)
+        post(client, wav_bytes())
+        assert fake.job["context"] == {"terms": ["Odoo", "SharePoint", "Jane Doe"]}
